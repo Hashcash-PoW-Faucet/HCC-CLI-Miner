@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -19,11 +20,13 @@ import (
 // =====================
 
 var (
-	baseURL    = flag.String("url", "https://hashcash-pow-faucet.dynv6.net/api", "Base URL of the faucet API")
-	privateKey = flag.String("key", "", "Private key (from the web faucet)")
-	workers    = flag.Int("workers", 4, "Number of PoW worker goroutines")
-	stopAtCap  = flag.Bool("stop-at-cap", true, "Stop when daily earn cap is reached")
-	client     = &http.Client{Timeout: 30 * time.Second}
+	baseURL           = flag.String("url", "https://hashcash-pow-faucet.dynv6.net/api", "Base URL of the faucet API")
+	privateKey        = flag.String("key", "", "Private key (from the web faucet)")
+	workers           = flag.Int("workers", 4, "Number of PoW worker goroutines")
+	stopAtCap         = flag.Bool("stop-at-cap", true, "Stop when daily earn cap is reached")	
+	showProgress      = flag.Bool("progress", true, "Show live PoW progress (hashrate/ETA) while searching")
+	progressIntervalS = flag.Int("progress-interval", 2, "Progress update interval in seconds")
+	client            = &http.Client{Timeout: 30 * time.Second}
 )
 
 // =====================
@@ -182,10 +185,11 @@ type powResult struct {
 	Nonce   uint64
 	Tries   uint64
 	Elapsed time.Duration
+	RateKHS float64
 }
 
 // Multi-worker PoW solver; workers search nonces i, i+N, i+2N, ...
-func solvePow(stamp string, bits int, numWorkers int) powResult {
+func solvePow(stamp string, bits int, numWorkers int, showProg bool, progInterval time.Duration) powResult {
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
@@ -193,6 +197,39 @@ func solvePow(stamp string, bits int, numWorkers int) powResult {
 	resultCh := make(chan powResult, 1)
 
 	start := time.Now()
+
+	var totalTries uint64
+
+	// Optional progress ticker
+	if showProg {
+		if progInterval <= 0 {
+			progInterval = 2 * time.Second
+		}
+		t := time.NewTicker(progInterval)
+		go func() {
+			defer t.Stop()
+			exp := expectedTries(bits)
+			for {
+				select {
+				case <-done:
+					return
+				case <-t.C:
+					tries := atomic.LoadUint64(&totalTries)
+					elapsed := time.Since(start)
+					rate := float64(tries) / elapsed.Seconds() / 1000.0
+					eta := time.Duration(0)
+					if rate > 0 {
+						remaining := exp - float64(tries)
+						if remaining < 0 {
+							remaining = 0
+						}
+						eta = time.Duration(remaining/(rate*1000.0)) * time.Second
+					}
+					fmt.Printf("\r[*] PoW searching... tries=%d  rate=%.1f kH/s  ETA≈%s", tries, rate, fmtMMSS(eta))
+				}
+			}
+		}()
+	}
 
 	for w := 0; w < numWorkers; w++ {
 		go func(startNonce uint64) {
@@ -207,13 +244,22 @@ func solvePow(stamp string, bits int, numWorkers int) powResult {
 				}
 				msg := fmt.Sprintf("%s|%d", stamp, nonce)
 				sum := sha256.Sum256([]byte(msg))
+				tries++
+				// Flush to global counter in chunks to reduce atomic overhead
+				if (tries & 0xFFF) == 0 {
+					atomic.AddUint64(&totalTries, 0x1000)
+				}
 				if leadingZeroBits(sum[:]) >= bits {
+					// Flush remainder (tries is local count; adjust by the last partial chunk)
+					atomic.AddUint64(&totalTries, tries&0xFFF)
 					elapsed := time.Since(start)
-					triesLocal := tries + 1
+					triesGlobal := atomic.LoadUint64(&totalTries)
+					rate := float64(triesGlobal) / elapsed.Seconds() / 1000.0
 					res := powResult{
 						Nonce:   nonce,
-						Tries:   triesLocal,
+						Tries:   triesGlobal,
 						Elapsed: elapsed,
+						RateKHS: rate,
 					}
 					select {
 					case resultCh <- res:
@@ -223,16 +269,56 @@ func solvePow(stamp string, bits int, numWorkers int) powResult {
 					return
 				}
 				nonce += step
-				tries++
 			}
 		}(uint64(w))
 	}
 
 	// Take first result
 	res := <-resultCh
-	// Approximate total tries as workerTries * numWorkers
-	res.Tries = res.Tries * uint64(numWorkers)
+	if showProg {
+		// Clear the progress line
+		fmt.Printf("\r")
+	}
 	return res
+}
+
+// =====================
+// Small UI helpers
+// =====================
+
+func fmtMMSS(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	s := int64(d.Seconds())
+	m := s / 60
+	sec := s % 60
+	return fmt.Sprintf("%dm %02ds", m, sec)
+}
+
+func expectedTries(bits int) float64 {
+	// Expected number of trials for a random oracle is ~2^bits
+	if bits <= 0 {
+		return 1
+	}
+	// Use float math; for typical faucet bits this is safe.
+	return float64(uint64(1)) << uint(bits)
+}
+
+func sleepWithCountdown(totalSeconds int64) {
+    if totalSeconds <= 0 {
+        return
+    }
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
+
+    for remaining := totalSeconds; remaining > 0; remaining-- {
+        min := remaining / 60
+        sec := remaining % 60
+        fmt.Printf("\r[*] Cooldown active, waiting %dm %02ds...", min, sec)
+        <-ticker.C
+    }
+    fmt.Printf("\r[*] Cooldown done.                      \n\n")
 }
 
 // =====================
@@ -268,24 +354,25 @@ func submitPow(stamp, sig string, nonce uint64) (*SubmitResponse, error) {
 	return &resp, nil
 }
 
-func mineOneCredit() (*SubmitResponse, error) {
+func mineOneCredit() (*SubmitResponse, powResult, error) {
 	ch, err := requestChallenge()
 	if err != nil {
-		return nil, err
+		return nil, powResult{}, err
 	}
 
 	fmt.Printf("[+] Challenge: bits=%d, stamp=%s...\n", ch.Bits, ch.Stamp[:32])
 
-	res := solvePow(ch.Stamp, ch.Bits, *workers)
+	interval := time.Duration(*progressIntervalS) * time.Second
+	res := solvePow(ch.Stamp, ch.Bits, *workers, *showProgress, interval)
 	khs := float64(res.Tries) / res.Elapsed.Seconds() / 1000.0
 	fmt.Printf("[+] PoW solved: nonce=%d, time=%.2fs, rate≈%.1f kH/s (%d workers)\n",
 		res.Nonce, res.Elapsed.Seconds(), khs, *workers)
 
 	sub, err := submitPow(ch.Stamp, ch.Sig, res.Nonce)
 	if err != nil {
-		return nil, err
+		return nil, res, err
 	}
-	return sub, nil
+	return sub, res, nil
 }
 
 // =====================
@@ -305,6 +392,7 @@ func main() {
 	fmt.Println("Base URL:", *baseURL)
 	fmt.Println("Workers:", *workers)
 	fmt.Println("Stop at daily cap:", *stopAtCap)
+	fmt.Println("Live progress:", *showProgress, "(interval:", *progressIntervalS, "s)")
 	fmt.Println("Press Ctrl+C to stop.\n")
 	// Best-effort cleanup on Ctrl+C / SIGTERM: release the IP mining lock
 	sigCh := make(chan os.Signal, 1)
@@ -315,6 +403,13 @@ func main() {
 		cancelPow()
 		os.Exit(0)
 	}()
+
+	sessionStart := time.Now()
+	lastKnownCredits := -1
+	var sessionCreditsEarned int
+	var sessionPowTries uint64
+	var sessionPowTime time.Duration
+	var sessionSolved int
 
 	for {
 		me, err := getAccountInfo()
@@ -328,6 +423,10 @@ func main() {
 		fmt.Printf("  Credits: %d\n", me.Credits)
 		fmt.Printf("  Earned today: %d / %d\n", me.EarnedToday, me.DailyEarnCap)
 
+		if lastKnownCredits < 0 {
+			lastKnownCredits = me.Credits
+		}
+
 		if *stopAtCap && me.DailyEarnCap > 0 && me.EarnedToday >= me.DailyEarnCap {
 			fmt.Println("[*] Daily cap reached, stopping miner.")
 			break
@@ -336,21 +435,44 @@ func main() {
 		now := me.ServerTime
 		if me.CooldownUntil > now {
 			wait := me.CooldownUntil - now + 2
-			min := wait / 60
-			sec := wait % 60
-			fmt.Printf("[*] Cooldown active, waiting %dm %ds...\n\n", min, sec)
-			time.Sleep(time.Duration(wait) * time.Second)
+			sleepWithCountdown(wait)
 			continue
 		}
 
 		fmt.Println("[*] Mining one credit...")
-		sub, err := mineOneCredit()
+		sub, powRes, err := mineOneCredit()
 		if err != nil {
 			fmt.Println("[!] Mining error:", err)
 			time.Sleep(10 * time.Second)
 			continue
 		}
-		fmt.Printf("[+] Submit ok: credits=%d, next_seq=%d\n\n", sub.Credits, sub.NextSeq)
+
+		// Session stats
+		sessionSolved++
+		sessionPowTries += powRes.Tries
+		sessionPowTime += powRes.Elapsed
+
+		delta := sub.Credits - lastKnownCredits
+		if delta < 0 {
+			delta = 0
+		}
+		sessionCreditsEarned += delta
+		lastKnownCredits = sub.Credits
+
+		sessionDur := time.Since(sessionStart)
+		creditsPerHour := 0.0
+		if sessionDur.Seconds() > 0 {
+			creditsPerHour = float64(sessionCreditsEarned) / sessionDur.Hours()
+		}
+		avgKHS := 0.0
+		if sessionPowTime.Seconds() > 0 {
+			avgKHS = float64(sessionPowTries) / sessionPowTime.Seconds() / 1000.0
+		}
+
+		fmt.Printf("[+] Submit ok: credits=%d, next_seq=%d\n", sub.Credits, sub.NextSeq)
+		fmt.Printf("    Session: +%d credits in %s (%.2f credits/hour), avg PoW rate≈%.1f kH/s, solves=%d\n\n",
+			sessionCreditsEarned, fmtMMSS(sessionDur), creditsPerHour, avgKHS, sessionSolved)
+
 		time.Sleep(2 * time.Second)
 	}
 }
