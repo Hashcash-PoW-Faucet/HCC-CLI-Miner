@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -164,22 +166,17 @@ func cancelPow() {
 // =====================
 
 func leadingZeroBits(b []byte) int {
-	bits := 0
-	for _, by := range b {
-		if by == 0 {
-			bits += 8
-		} else {
-			for j := 7; j >= 0; j-- {
-				if ((by >> uint(j)) & 1) == 0 {
-					bits++
-				} else {
-					return bits
-				}
-			}
-			return bits
-		}
-	}
-	return bits
+    total := 0
+    for _, v := range b {
+        if v == 0 {
+            total += 8
+            continue
+        }
+        // bits.LeadingZeros8 returns 0–8 for the 8-bit value.
+        total += bits.LeadingZeros8(uint8(v))
+        break
+    }
+    return total
 }
 
 type powResult struct {
@@ -191,96 +188,110 @@ type powResult struct {
 
 // Multi-worker PoW solver; workers search nonces i, i+N, i+2N, ...
 func solvePow(stamp string, bits int, numWorkers int, showProg bool, progInterval time.Duration) powResult {
-	if numWorkers < 1 {
-		numWorkers = 1
-	}
-	done := make(chan struct{})
-	resultCh := make(chan powResult, 1)
+    if numWorkers < 1 {
+        numWorkers = 1
+    }
+    done := make(chan struct{})
+    resultCh := make(chan powResult, 1)
 
-	start := time.Now()
+    start := time.Now()
 
-	var totalTries uint64
+    var totalTries uint64
 
-	// Optional progress ticker
-	if showProg {
-		if progInterval <= 0 {
-			progInterval = 2 * time.Second
-		}
-		t := time.NewTicker(progInterval)
-		go func() {
-			defer t.Stop()
-			exp := expectedTries(bits)
-			for {
-				select {
-				case <-done:
-					return
-				case <-t.C:
-					tries := atomic.LoadUint64(&totalTries)
-					elapsed := time.Since(start)
-					rate := float64(tries) / elapsed.Seconds() / 1000.0
-					eta := time.Duration(0)
-					if rate > 0 {
-						remaining := exp - float64(tries)
-						if remaining < 0 {
-							remaining = 0
-						}
-						eta = time.Duration(remaining/(rate*1000.0)) * time.Second
-					}
-					fmt.Printf("\r[*] PoW searching... tries=%d  rate=%.1f kH/s  ETA≈%s", tries, rate, fmtMMSS(eta))
-				}
-			}
-		}()
-	}
+    // Optional progress ticker
+    if showProg {
+        if progInterval <= 0 {
+            progInterval = 2 * time.Second
+        }
+        t := time.NewTicker(progInterval)
+        go func() {
+            defer t.Stop()
+            exp := expectedTries(bits)
+            for {
+                select {
+                case <-done:
+                    return
+                case <-t.C:
+                    tries := atomic.LoadUint64(&totalTries)
+                    elapsed := time.Since(start)
+                    rate := float64(tries) / elapsed.Seconds() / 1000.0
+                    eta := time.Duration(0)
+                    if rate > 0 {
+                        remaining := exp - float64(tries)
+                        if remaining < 0 {
+                            remaining = 0
+                        }
+                        eta = time.Duration(remaining/(rate*1000.0)) * time.Second
+                    }
+                    fmt.Printf("\r[*] PoW searching... tries=%d  rate=%.1f kH/s  ETA≈%s", tries, rate, fmtMMSS(eta))
+                }
+            }
+        }()
+    }
 
-	for w := 0; w < numWorkers; w++ {
-		go func(startNonce uint64) {
-			var tries uint64
-			nonce := startNonce
-			step := uint64(numWorkers)
-			for {
-				select {
-				case <-done:
-					return
-				default:
-				}
-				msg := fmt.Sprintf("%s|%d", stamp, nonce)
-				sum := sha256.Sum256([]byte(msg))
-				tries++
-				// Flush to global counter in chunks to reduce atomic overhead
-				if (tries & 0xFFF) == 0 {
-					atomic.AddUint64(&totalTries, 0x1000)
-				}
-				if leadingZeroBits(sum[:]) >= bits {
-					// Flush remainder (tries is local count; adjust by the last partial chunk)
-					atomic.AddUint64(&totalTries, tries&0xFFF)
-					elapsed := time.Since(start)
-					triesGlobal := atomic.LoadUint64(&totalTries)
-					rate := float64(triesGlobal) / elapsed.Seconds() / 1000.0
-					res := powResult{
-						Nonce:   nonce,
-						Tries:   triesGlobal,
-						Elapsed: elapsed,
-						RateKHS: rate,
-					}
-					select {
-					case resultCh <- res:
-						close(done)
-					default:
-					}
-					return
-				}
-				nonce += step
-			}
-		}(uint64(w))
-	}
+    for w := 0; w < numWorkers; w++ {
+        go func(startNonce uint64) {
+            // Prebuild the constant prefix "stamp|"
+            prefix := append([]byte(stamp), '|')
+            // Reusable buffer: prefix + up to ~20 digits of nonce
+            buf := make([]byte, len(prefix), len(prefix)+24)
+            copy(buf, prefix)
 
-	// Take first result
-	res := <-resultCh
-	if showProg {
-		// Clear the progress line
-		fmt.Printf("\r")
-	}
-	return res
+            var tries uint64
+            nonce := startNonce
+            step := uint64(numWorkers)
+
+            for {
+                select {
+                case <-done:
+                    return
+                default:
+                }
+
+                // Rebuild buffer: prefix + decimal nonce
+                b := buf[:len(prefix)]
+                b = strconv.AppendUint(b, nonce, 10)
+
+                sum := sha256.Sum256(b)
+                tries++
+
+                // Flush to global counter in chunks to reduce atomic overhead
+                if (tries & 0xFFF) == 0 {
+                    atomic.AddUint64(&totalTries, 0x1000)
+                }
+
+                if leadingZeroBits(sum[:]) >= bits {
+                    // Flush remainder (tries is local count; adjust by the last partial chunk)
+                    atomic.AddUint64(&totalTries, tries&0xFFF)
+                    elapsed := time.Since(start)
+                    triesGlobal := atomic.LoadUint64(&totalTries)
+                    rate := float64(triesGlobal) / elapsed.Seconds() / 1000.0
+                    res := powResult{
+                        Nonce:   nonce,
+                        Tries:   triesGlobal,
+                        Elapsed: elapsed,
+                        RateKHS: rate,
+                    }
+                    select {
+                    case resultCh <- res:
+                        close(done)
+                    default:
+                    }
+                    return
+                }
+
+                nonce += step
+            }
+        }(uint64(w))
+    }
+
+    // Take first result
+    res := <-resultCh
+    if showProg {
+        // Clear the progress line
+        fmt.Printf("\r")
+    }
+    return res
 }
 
 // =====================
