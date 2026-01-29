@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"sync/atomic"
 	"syscall"
@@ -25,8 +26,8 @@ import (
 var (
 	baseURL           = flag.String("url", "https://hashcash-pow-faucet.dynv6.net/api", "Base URL of the faucet API")
 	privateKey        = flag.String("key", "", "Private key (from the web faucet)")
-	workers           = flag.Int("workers", 4, "Number of PoW worker goroutines")
-	stopAtCap         = flag.Bool("stop-at-cap", true, "Stop when daily earn cap is reached")	
+	workers           = flag.Int("workers", 4, "Number of PoW worker goroutines (0 = auto-detect CPU cores)")
+	stopAtCap         = flag.Bool("stop-at-cap", true, "Stop when daily earn cap is reached")
 	showProgress      = flag.Bool("progress", true, "Show live PoW progress (hashrate/ETA) while searching")
 	progressIntervalS = flag.Int("progress-interval", 2, "Progress update interval in seconds")
 	client            = &http.Client{Timeout: 30 * time.Second}
@@ -166,17 +167,17 @@ func cancelPow() {
 // =====================
 
 func leadingZeroBits(b []byte) int {
-    total := 0
-    for _, v := range b {
-        if v == 0 {
-            total += 8
-            continue
-        }
-        // bits.LeadingZeros8 returns 0–8 for the 8-bit value.
-        total += bits.LeadingZeros8(uint8(v))
-        break
-    }
-    return total
+	total := 0
+	for _, v := range b {
+		if v == 0 {
+			total += 8
+			continue
+		}
+		// bits.LeadingZeros8 returns 0–8 for the 8-bit value.
+		total += bits.LeadingZeros8(uint8(v))
+		break
+	}
+	return total
 }
 
 type powResult struct {
@@ -188,110 +189,110 @@ type powResult struct {
 
 // Multi-worker PoW solver; workers search nonces i, i+N, i+2N, ...
 func solvePow(stamp string, bits int, numWorkers int, showProg bool, progInterval time.Duration) powResult {
-    if numWorkers < 1 {
-        numWorkers = 1
-    }
-    done := make(chan struct{})
-    resultCh := make(chan powResult, 1)
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+	done := make(chan struct{})
+	resultCh := make(chan powResult, 1)
 
-    start := time.Now()
+	start := time.Now()
 
-    var totalTries uint64
+	var totalTries uint64
 
-    // Optional progress ticker
-    if showProg {
-        if progInterval <= 0 {
-            progInterval = 2 * time.Second
-        }
-        t := time.NewTicker(progInterval)
-        go func() {
-            defer t.Stop()
-            exp := expectedTries(bits)
-            for {
-                select {
-                case <-done:
-                    return
-                case <-t.C:
-                    tries := atomic.LoadUint64(&totalTries)
-                    elapsed := time.Since(start)
-                    rate := float64(tries) / elapsed.Seconds() / 1000.0
-                    eta := time.Duration(0)
-                    if rate > 0 {
-                        remaining := exp - float64(tries)
-                        if remaining < 0 {
-                            remaining = 0
-                        }
-                        eta = time.Duration(remaining/(rate*1000.0)) * time.Second
-                    }
-                    fmt.Printf("\r[*] PoW searching... tries=%d  rate=%.1f kH/s  ETA≈%s", tries, rate, fmtMMSS(eta))
-                }
-            }
-        }()
-    }
+	// Optional progress ticker
+	if showProg {
+		if progInterval <= 0 {
+			progInterval = 2 * time.Second
+		}
+		t := time.NewTicker(progInterval)
+		go func() {
+			defer t.Stop()
+			exp := expectedTries(bits)
+			for {
+				select {
+				case <-done:
+					return
+				case <-t.C:
+					tries := atomic.LoadUint64(&totalTries)
+					elapsed := time.Since(start)
+					rate := float64(tries) / elapsed.Seconds() / 1000.0
+					eta := time.Duration(0)
+					if rate > 0 {
+						remaining := exp - float64(tries)
+						if remaining < 0 {
+							remaining = 0
+						}
+						eta = time.Duration(remaining/(rate*1000.0)) * time.Second
+					}
+					fmt.Printf("\r[*] PoW searching... tries=%d  rate=%.1f kH/s  ETA≈%s", tries, rate, fmtMMSS(eta))
+				}
+			}
+		}()
+	}
 
-    for w := 0; w < numWorkers; w++ {
-        go func(startNonce uint64) {
-            // Prebuild the constant prefix "stamp|"
-            prefix := append([]byte(stamp), '|')
-            // Reusable buffer: prefix + up to ~20 digits of nonce
-            buf := make([]byte, len(prefix), len(prefix)+24)
-            copy(buf, prefix)
+	for w := 0; w < numWorkers; w++ {
+		go func(startNonce uint64) {
+			// Prebuild the constant prefix "stamp|"
+			prefix := append([]byte(stamp), '|')
+			// Reusable buffer: prefix + up to ~20 digits of nonce
+			buf := make([]byte, len(prefix), len(prefix)+24)
+			copy(buf, prefix)
 
-            var tries uint64
-            nonce := startNonce
-            step := uint64(numWorkers)
+			var tries uint64
+			nonce := startNonce
+			step := uint64(numWorkers)
 
-            for {
-                select {
-                case <-done:
-                    return
-                default:
-                }
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
 
-                // Rebuild buffer: prefix + decimal nonce
-                b := buf[:len(prefix)]
-                b = strconv.AppendUint(b, nonce, 10)
+				// Rebuild buffer: prefix + decimal nonce
+				b := buf[:len(prefix)]
+				b = strconv.AppendUint(b, nonce, 10)
 
-                sum := sha256.Sum256(b)
-                tries++
+				sum := sha256.Sum256(b)
+				tries++
 
-                // Flush to global counter in chunks to reduce atomic overhead
-                if (tries & 0xFFF) == 0 {
-                    atomic.AddUint64(&totalTries, 0x1000)
-                }
+				// Flush to global counter in chunks to reduce atomic overhead
+				if (tries & 0xFFF) == 0 {
+					atomic.AddUint64(&totalTries, 0x1000)
+				}
 
-                if leadingZeroBits(sum[:]) >= bits {
-                    // Flush remainder (tries is local count; adjust by the last partial chunk)
-                    atomic.AddUint64(&totalTries, tries&0xFFF)
-                    elapsed := time.Since(start)
-                    triesGlobal := atomic.LoadUint64(&totalTries)
-                    rate := float64(triesGlobal) / elapsed.Seconds() / 1000.0
-                    res := powResult{
-                        Nonce:   nonce,
-                        Tries:   triesGlobal,
-                        Elapsed: elapsed,
-                        RateKHS: rate,
-                    }
-                    select {
-                    case resultCh <- res:
-                        close(done)
-                    default:
-                    }
-                    return
-                }
+				if leadingZeroBits(sum[:]) >= bits {
+					// Flush remainder (tries is local count; adjust by the last partial chunk)
+					atomic.AddUint64(&totalTries, tries&0xFFF)
+					elapsed := time.Since(start)
+					triesGlobal := atomic.LoadUint64(&totalTries)
+					rate := float64(triesGlobal) / elapsed.Seconds() / 1000.0
+					res := powResult{
+						Nonce:   nonce,
+						Tries:   triesGlobal,
+						Elapsed: elapsed,
+						RateKHS: rate,
+					}
+					select {
+					case resultCh <- res:
+						close(done)
+					default:
+					}
+					return
+				}
 
-                nonce += step
-            }
-        }(uint64(w))
-    }
+				nonce += step
+			}
+		}(uint64(w))
+	}
 
-    // Take first result
-    res := <-resultCh
-    if showProg {
-        // Clear the progress line
-        fmt.Printf("\r")
-    }
-    return res
+	// Take first result
+	res := <-resultCh
+	if showProg {
+		// Clear the progress line
+		fmt.Printf("\r")
+	}
+	return res
 }
 
 // =====================
@@ -318,19 +319,19 @@ func expectedTries(bits int) float64 {
 }
 
 func sleepWithCountdown(totalSeconds int64) {
-    if totalSeconds <= 0 {
-        return
-    }
-    ticker := time.NewTicker(1 * time.Second)
-    defer ticker.Stop()
+	if totalSeconds <= 0 {
+		return
+	}
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
-    for remaining := totalSeconds; remaining > 0; remaining-- {
-        min := remaining / 60
-        sec := remaining % 60
-        fmt.Printf("\r[*] Cooldown active, waiting %dm %02ds...", min, sec)
-        <-ticker.C
-    }
-    fmt.Printf("\r[*] Cooldown done.                      \n\n")
+	for remaining := totalSeconds; remaining > 0; remaining-- {
+		min := remaining / 60
+		sec := remaining % 60
+		fmt.Printf("\r[*] Cooldown active, waiting %dm %02ds...", min, sec)
+		<-ticker.C
+	}
+	fmt.Printf("\r[*] Cooldown done.                      \n\n")
 }
 
 // =====================
@@ -393,6 +394,11 @@ func mineOneCredit() (*SubmitResponse, powResult, error) {
 
 func main() {
 	flag.Parse()
+
+	// Auto-detect worker count if set to 0 or below
+	if *workers <= 0 {
+		*workers = runtime.NumCPU()
+	}
 
 	if *privateKey == "" {
 		fmt.Println("ERROR: please provide -key with your private faucet key.")
