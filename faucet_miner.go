@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -28,6 +29,7 @@ var (
 	privateKey        = flag.String("key", "", "Private key (from the web faucet)")
 	workers           = flag.Int("workers", 4, "Number of PoW worker goroutines (0 = auto-detect CPU cores)")
 	stopAtCap         = flag.Bool("stop-at-cap", true, "Stop when daily earn cap is reached")
+	extremeMode       = flag.Bool("extreme", false, "Enable HashCash Extreme mode (no cooldown, higher difficulty, separate daily cap)")
 	showProgress      = flag.Bool("progress", true, "Show live PoW progress (hashrate/ETA) while searching")
 	progressIntervalS = flag.Int("progress-interval", 2, "Progress update interval in seconds")
 	client            = &http.Client{Timeout: 30 * time.Second}
@@ -346,9 +348,18 @@ func getAccountInfo() (*MeResponse, error) {
 	return &me, nil
 }
 
-func requestChallenge() (*ChallengeResponse, error) {
+func requestChallenge(extreme bool) (*ChallengeResponse, error) {
+	var (
+		path   = "/challenge"
+		action = "earn_credit"
+	)
+	if extreme {
+		path = "/challenge_extreme"
+		action = "earn_extreme"
+	}
+
 	var ch ChallengeResponse
-	if err := apiPost("/challenge", ChallengeRequest{Action: "earn_credit"}, &ch); err != nil {
+	if err := apiPost(path, ChallengeRequest{Action: action}, &ch); err != nil {
 		return nil, err
 	}
 	return &ch, nil
@@ -367,19 +378,24 @@ func submitPow(stamp, sig string, nonce uint64) (*SubmitResponse, error) {
 	return &resp, nil
 }
 
-func mineOneCredit() (*SubmitResponse, powResult, error) {
-	ch, err := requestChallenge()
+func mineOneCredit(extreme bool) (*SubmitResponse, powResult, error) {
+	ch, err := requestChallenge(extreme)
 	if err != nil {
 		return nil, powResult{}, err
 	}
 
-	fmt.Printf("[+] Challenge: bits=%d, stamp=%s...\n", ch.Bits, ch.Stamp[:32])
+	modeLabel := "normal"
+	if extreme {
+		modeLabel = "EXTREME"
+	}
+
+	fmt.Printf("[+] Challenge (%s): bits=%d, stamp=%s...\n", modeLabel, ch.Bits, ch.Stamp[:32])
 
 	interval := time.Duration(*progressIntervalS) * time.Second
 	res := solvePow(ch.Stamp, ch.Bits, *workers, *showProgress, interval)
 	khs := float64(res.Tries) / res.Elapsed.Seconds() / 1000.0
-	fmt.Printf("[+] PoW solved: nonce=%d, time=%.2fs, rate≈%.1f kH/s (%d workers)\n",
-		res.Nonce, res.Elapsed.Seconds(), khs, *workers)
+	fmt.Printf("[+] PoW solved (%s): nonce=%d, time=%.2fs, rate≈%.1f kH/s (%d workers)\n",
+		modeLabel, res.Nonce, res.Elapsed.Seconds(), khs, *workers)
 
 	sub, err := submitPow(ch.Stamp, ch.Sig, res.Nonce)
 	if err != nil {
@@ -411,6 +427,11 @@ func main() {
 	fmt.Println("Workers:", *workers)
 	fmt.Println("Stop at daily cap:", *stopAtCap)
 	fmt.Println("Live progress:", *showProgress, "(interval:", *progressIntervalS, "s)")
+	if *extremeMode {
+		fmt.Println("Mode: EXTREME (no cooldown, higher difficulty, separate daily cap)")
+	} else {
+		fmt.Println("Mode: normal")
+	}
 	fmt.Println("Press Ctrl+C to stop.\n")
 	// Best-effort cleanup on Ctrl+C / SIGTERM: release the IP mining lock
 	sigCh := make(chan os.Signal, 1)
@@ -445,21 +466,33 @@ func main() {
 			lastKnownCredits = me.Credits
 		}
 
-		if *stopAtCap && me.DailyEarnCap > 0 && me.EarnedToday >= me.DailyEarnCap {
+		if !*extremeMode && *stopAtCap && me.DailyEarnCap > 0 && me.EarnedToday >= me.DailyEarnCap {
 			fmt.Println("[*] Daily cap reached, stopping miner.")
 			break
 		}
 
-		now := me.ServerTime
-		if me.CooldownUntil > now {
-			wait := me.CooldownUntil - now + 2
-			sleepWithCountdown(wait)
-			continue
+		if !*extremeMode {
+			now := me.ServerTime
+			if me.CooldownUntil > now {
+				wait := me.CooldownUntil - now + 2
+				sleepWithCountdown(wait)
+				continue
+			}
 		}
 
-		fmt.Println("[*] Mining one credit...")
-		sub, powRes, err := mineOneCredit()
+		if *extremeMode {
+			fmt.Println("[*] Mining one EXTREME credit...")
+		} else {
+			fmt.Println("[*] Mining one credit...")
+		}
+
+		sub, powRes, err := mineOneCredit(*extremeMode)
 		if err != nil {
+			// If the server reports that the extreme daily cap has been reached, stop cleanly.
+			if *extremeMode && strings.Contains(err.Error(), "extreme daily cap") {
+				fmt.Println("[*] Extreme daily cap reached according to server, stopping miner.")
+				break
+			}
 			fmt.Println("[!] Mining error:", err)
 			time.Sleep(10 * time.Second)
 			continue
