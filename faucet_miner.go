@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -32,6 +34,7 @@ var (
 	extremeMode       = flag.Bool("extreme", false, "Enable HashCash Extreme mode (no cooldown, higher difficulty, separate daily cap)")
 	showProgress      = flag.Bool("progress", true, "Show live PoW progress (hashrate/ETA) while searching")
 	progressIntervalS = flag.Int("progress-interval", 2, "Progress update interval in seconds")
+	nonceOffsetFlag   = flag.Int64("nonce-offset", -1, "Nonce start offset for this process (-1 = random). Use different values to avoid duplicate work across multiple miners.")
 	client            = &http.Client{Timeout: 30 * time.Second}
 )
 
@@ -168,6 +171,19 @@ func cancelPow() {
 // PoW implementation
 // =====================
 
+func getNonceOffset() uint64 {
+	if nonceOffsetFlag != nil && *nonceOffsetFlag >= 0 {
+		return uint64(*nonceOffsetFlag)
+	}
+	// Random default: avoid multiple instances searching the exact same nonces.
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return binary.LittleEndian.Uint64(b[:])
+	}
+	// Fallback if crypto/rand fails (should be rare)
+	return uint64(time.Now().UnixNano())
+}
+
 func leadingZeroBits(b []byte) int {
 	total := 0
 	for _, v := range b {
@@ -183,14 +199,15 @@ func leadingZeroBits(b []byte) int {
 }
 
 type powResult struct {
-	Nonce   uint64
-	Tries   uint64
-	Elapsed time.Duration
-	RateKHS float64
+	Nonce    uint64
+	Tries    uint64
+	Elapsed  time.Duration
+	RateKHS  float64
+	Canceled bool
 }
 
-// Multi-worker PoW solver; workers search nonces i, i+N, i+2N, ...
-func solvePow(stamp string, bits int, numWorkers int, showProg bool, progInterval time.Duration) powResult {
+// Multi-worker PoW solver; workers search nonces i+offset, i+N+offset, i+2N+offset, ...
+func solvePow(stamp string, bits int, numWorkers int, showProg bool, progInterval time.Duration, nonceOffset uint64, cancel <-chan struct{}) powResult {
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
@@ -200,6 +217,23 @@ func solvePow(stamp string, bits int, numWorkers int, showProg bool, progInterva
 	start := time.Now()
 
 	var totalTries uint64
+
+	// If canceled (e.g., another miner advanced seq), return early with Canceled=true.
+	go func() {
+		<-cancel
+		elapsed := time.Since(start)
+		triesGlobal := atomic.LoadUint64(&totalTries)
+		rate := 0.0
+		if elapsed.Seconds() > 0 {
+			rate = float64(triesGlobal) / elapsed.Seconds() / 1000.0
+		}
+		res := powResult{Nonce: 0, Tries: triesGlobal, Elapsed: elapsed, RateKHS: rate, Canceled: true}
+		select {
+		case resultCh <- res:
+			close(done)
+		default:
+		}
+	}()
 
 	// Optional progress ticker
 	if showProg {
@@ -213,6 +247,8 @@ func solvePow(stamp string, bits int, numWorkers int, showProg bool, progInterva
 			for {
 				select {
 				case <-done:
+					return
+				case <-cancel:
 					return
 				case <-t.C:
 					tries := atomic.LoadUint64(&totalTries)
@@ -248,6 +284,8 @@ func solvePow(stamp string, bits int, numWorkers int, showProg bool, progInterva
 				select {
 				case <-done:
 					return
+				case <-cancel:
+					return
 				default:
 				}
 
@@ -270,10 +308,11 @@ func solvePow(stamp string, bits int, numWorkers int, showProg bool, progInterva
 					triesGlobal := atomic.LoadUint64(&totalTries)
 					rate := float64(triesGlobal) / elapsed.Seconds() / 1000.0
 					res := powResult{
-						Nonce:   nonce,
-						Tries:   triesGlobal,
-						Elapsed: elapsed,
-						RateKHS: rate,
+						Nonce:    nonce,
+						Tries:    triesGlobal,
+						Elapsed:  elapsed,
+						RateKHS:  rate,
+						Canceled: false,
 					}
 					select {
 					case resultCh <- res:
@@ -285,7 +324,7 @@ func solvePow(stamp string, bits int, numWorkers int, showProg bool, progInterva
 
 				nonce += step
 			}
-		}(uint64(w))
+		}(nonceOffset + uint64(w))
 	}
 
 	// Take first result
@@ -336,6 +375,22 @@ func sleepWithCountdown(totalSeconds int64) {
 	fmt.Printf("\r[*] Cooldown done.                      \n\n")
 }
 
+// Extract seq=... from stamp like: v1|act=...|acct=...|seq=18|bits=...|...
+func stampSeq(stamp string) (int64, bool) {
+	parts := strings.Split(stamp, "|")
+	for _, p := range parts {
+		if strings.HasPrefix(p, "seq=") {
+			v := strings.TrimPrefix(p, "seq=")
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return 0, false
+			}
+			return n, true
+		}
+	}
+	return 0, false
+}
+
 // =====================
 // Mining logic
 // =====================
@@ -378,30 +433,73 @@ func submitPow(stamp, sig string, nonce uint64) (*SubmitResponse, error) {
 	return &resp, nil
 }
 
-func mineOneCredit(extreme bool) (*SubmitResponse, powResult, error) {
-	ch, err := requestChallenge(extreme)
-	if err != nil {
-		return nil, powResult{}, err
-	}
-
+func mineOneCredit(extreme bool, nonceOffset uint64) (*SubmitResponse, powResult, error) {
 	modeLabel := "normal"
 	if extreme {
 		modeLabel = "EXTREME"
 	}
 
-	fmt.Printf("[+] Challenge (%s): bits=%d, stamp=%s...\n", modeLabel, ch.Bits, ch.Stamp[:32])
+	for {
+		ch, err := requestChallenge(extreme)
+		if err != nil {
+			return nil, powResult{}, err
+		}
 
-	interval := time.Duration(*progressIntervalS) * time.Second
-	res := solvePow(ch.Stamp, ch.Bits, *workers, *showProgress, interval)
-	khs := float64(res.Tries) / res.Elapsed.Seconds() / 1000.0
-	fmt.Printf("[+] PoW solved (%s): nonce=%d, time=%.2fs, rate≈%.1f kH/s (%d workers)\n",
-		modeLabel, res.Nonce, res.Elapsed.Seconds(), khs, *workers)
+		curSeq, _ := stampSeq(ch.Stamp)
+		fmt.Printf("[+] Challenge (%s): bits=%d, stamp=%s...\n", modeLabel, ch.Bits, ch.Stamp[:32])
 
-	sub, err := submitPow(ch.Stamp, ch.Sig, res.Nonce)
-	if err != nil {
-		return nil, res, err
+		// Cancel channel to stop current search if we detect the seq has advanced.
+		cancelCh := make(chan struct{})
+		stopCheck := make(chan struct{})
+
+		// Every 60s, re-fetch challenge and compare seq. If seq changed, restart.
+		go func(origSeq int64) {
+			t := time.NewTicker(60 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-stopCheck:
+					return
+				case <-t.C:
+					latest, err := requestChallenge(extreme)
+					if err != nil {
+						// ignore transient errors; keep mining
+						continue
+					}
+					newSeq, ok := stampSeq(latest.Stamp)
+					if ok && newSeq != origSeq {
+						fmt.Println("\n[!] another miner likely won. Refreshing challenge...")
+						close(cancelCh)
+						return
+					}
+				}
+			}
+		}(curSeq)
+
+		interval := time.Duration(*progressIntervalS) * time.Second
+		res := solvePow(ch.Stamp, ch.Bits, *workers, *showProgress, interval, nonceOffset, cancelCh)
+
+		// Stop the checker goroutine.
+		close(stopCheck)
+
+		if res.Canceled {
+			// Immediately restart loop and mine on the fresh challenge.
+			continue
+		}
+
+		khs := 0.0
+		if res.Elapsed.Seconds() > 0 {
+			khs = float64(res.Tries) / res.Elapsed.Seconds() / 1000.0
+		}
+		fmt.Printf("[+] PoW solved (%s): nonce=%d, time=%.2fs, rate≈%.1f kH/s (%d workers)\n",
+			modeLabel, res.Nonce, res.Elapsed.Seconds(), khs, *workers)
+
+		sub, err := submitPow(ch.Stamp, ch.Sig, res.Nonce)
+		if err != nil {
+			return nil, res, err
+		}
+		return sub, res, nil
 	}
-	return sub, res, nil
 }
 
 // =====================
@@ -432,6 +530,8 @@ func main() {
 	} else {
 		fmt.Println("Mode: normal")
 	}
+	nonceOffset := getNonceOffset()
+	fmt.Printf("Nonce offset: %d (use -nonce-offset to set manually)\n", nonceOffset)
 	fmt.Println("Press Ctrl+C to stop.\n")
 	// Best-effort cleanup on Ctrl+C / SIGTERM: release the IP mining lock
 	sigCh := make(chan os.Signal, 1)
@@ -490,13 +590,25 @@ func main() {
 			fmt.Println("[*] Mining one credit...")
 		}
 
-		sub, powRes, err := mineOneCredit(*extremeMode)
+		sub, powRes, err := mineOneCredit(*extremeMode, nonceOffset)
 		if err != nil {
+			errStr := err.Error()
+
 			// If the server reports that the extreme daily cap has been reached, stop cleanly.
-			if *extremeMode && strings.Contains(err.Error(), "extreme daily cap") {
+			if *extremeMode && strings.Contains(errStr, "extreme daily cap") {
 				fmt.Println("[*] Extreme daily cap reached according to server, stopping miner.")
 				break
 			}
+
+			// If another miner already submitted the solution for this seq/stamp, the server returns 409.
+			// In that case, immediately continue (fetch a new challenge on the next loop) instead of sleeping.
+			if strings.Contains(errStr, " 409 ") || strings.Contains(errStr, "409") || strings.Contains(errStr, "stale seq") || strings.Contains(errStr, "replay") {
+				fmt.Println("[!] Stale seq / replay detected (another miner likely won). Refreshing challenge...")
+				// small backoff to avoid tight loops if multiple miners race continuously
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+
 			fmt.Println("[!] Mining error:", err)
 			time.Sleep(10 * time.Second)
 			continue
