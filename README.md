@@ -1,4 +1,4 @@
-# Hashcash PoW Faucet CLI Miner
+# Hashcash CLI Miner
 
 This is a simple command‑line miner for the experimental **Hashcash PoW Faucet**.  
 It talks to the public HTTP API (`/me`, `/challenge`, `/challenge_extreme`, `/submit_pow`, `/cancel_pow`) and solves
