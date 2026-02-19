@@ -28,10 +28,11 @@ import (
 
 var (
 	baseURL           = flag.String("url", "https://hashcash-pow-faucet.dynv6.net/api", "Base URL of the Hashcash PoW faucet API")
-	privateKey        = flag.String("key", "", "Private key (from the web Hashcash PoW faucet)")
+	privateKey        = flag.String("key", "", "Private key (from the web UI)")
 	workers           = flag.Int("workers", 0, "Number of PoW worker goroutines (0 = auto-detect CPU cores)")
 	stopAtCap         = flag.Bool("stop-at-cap", true, "Stop when daily earn cap is reached")
-	extremeMode       = flag.Bool("extreme", false, "Enable Extreme Mining mode (no cooldown, higher difficulty, separate daily cap)")
+	extremeMode       = flag.Bool("extreme", false, "Enable HashCash Extreme mode (no cooldown, higher difficulty, separate daily cap)")
+	potatoMode        = flag.Bool("potato", false, "Enable HashCash POTATO mode (lower difficulty, counts toward normal cap, longer cooldown)")
 	showProgress      = flag.Bool("progress", true, "Show live PoW progress (hashrate/ETA) while searching")
 	progressIntervalS = flag.Int("progress-interval", 2, "Progress update interval in seconds")
 	nonceOffsetFlag   = flag.Int64("nonce-offset", -1, "Nonce start offset for this process (-1 = random). Use different values to avoid duplicate work across multiple miners.")
@@ -398,14 +399,20 @@ func getAccountInfo() (*MeResponse, error) {
 	return &me, nil
 }
 
-func requestChallenge(extreme bool) (*ChallengeResponse, error) {
+func requestChallenge(mode string) (*ChallengeResponse, error) {
 	var (
 		path   = "/challenge"
 		action = "earn_credit"
 	)
-	if extreme {
+	switch mode {
+	case "extreme":
 		path = "/challenge_extreme"
 		action = "earn_extreme"
+	case "potato":
+		path = "/challenge_potato"
+		action = "earn_potato"
+	default:
+		// normal
 	}
 
 	var ch ChallengeResponse
@@ -428,14 +435,17 @@ func submitPow(stamp, sig string, nonce uint64) (*SubmitResponse, error) {
 	return &resp, nil
 }
 
-func mineOneCredit(extreme bool, nonceOffset uint64) (*SubmitResponse, powResult, error) {
+func mineOneCredit(mode string, nonceOffset uint64) (*SubmitResponse, powResult, error) {
 	modeLabel := "normal"
-	if extreme {
+	switch mode {
+	case "extreme":
 		modeLabel = "EXTREME"
+	case "potato":
+		modeLabel = "POTATO"
 	}
 
 	for {
-		ch, err := requestChallenge(extreme)
+		ch, err := requestChallenge(mode)
 		if err != nil {
 			return nil, powResult{}, err
 		}
@@ -456,7 +466,7 @@ func mineOneCredit(extreme bool, nonceOffset uint64) (*SubmitResponse, powResult
 				case <-stopCheck:
 					return
 				case <-t.C:
-					latest, err := requestChallenge(extreme)
+					latest, err := requestChallenge(mode)
 					if err != nil {
 						// ignore transient errors; keep mining
 						continue
@@ -504,6 +514,11 @@ func mineOneCredit(extreme bool, nonceOffset uint64) (*SubmitResponse, powResult
 func main() {
 	flag.Parse()
 
+	if *extremeMode && *potatoMode {
+		fmt.Println("ERROR: -extreme and -potato are mutually exclusive. Choose one.")
+		os.Exit(1)
+	}
+
 	// Auto-detect worker count if set to 0 or below
 	if *workers <= 0 {
 		*workers = runtime.NumCPU()
@@ -517,12 +532,12 @@ func main() {
 	}
 
 	if *privateKey == "" {
-		fmt.Println("ERROR: please provide -key with your private HCC key.")
+		fmt.Println("ERROR: please provide -key with your private faucet key.")
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	fmt.Println("=== HCC CLI Miner ===")
+	fmt.Println("=== Hashcash PoW Faucet CLI Miner ===")
 	fmt.Println("Base URL:", *baseURL)
 	fmt.Println("Workers:", *workers)
 	fmt.Println("NumCPU:", runtime.NumCPU())
@@ -531,6 +546,8 @@ func main() {
 	fmt.Println("Live progress:", *showProgress, "(interval:", *progressIntervalS, "s)")
 	if *extremeMode {
 		fmt.Println("Mode: EXTREME (no cooldown, higher difficulty, separate daily cap)")
+	} else if *potatoMode {
+		fmt.Println("Mode: POTATO (lower difficulty, separate daily cap; normal cooldown)")
 	} else {
 		fmt.Println("Mode: normal")
 	}
@@ -566,6 +583,8 @@ func main() {
 		fmt.Printf("  Credits: %d\n", me.Credits)
 		if *extremeMode {
 			fmt.Printf("  Earned EXTREME today: %d\n", me.EarnedToday)
+		} else if *potatoMode {
+			fmt.Printf("  Earned POTATO today: %d\n", me.EarnedToday)
 		} else {
 			fmt.Printf("  Earned today: %d / %d\n", me.EarnedToday, me.DailyEarnCap)
 		}
@@ -574,7 +593,7 @@ func main() {
 			lastKnownCredits = me.Credits
 		}
 
-		if !*extremeMode && *stopAtCap && me.DailyEarnCap > 0 && me.EarnedToday >= me.DailyEarnCap {
+		if !*extremeMode && !*potatoMode && *stopAtCap && me.DailyEarnCap > 0 && me.EarnedToday >= me.DailyEarnCap {
 			fmt.Println("[*] Daily cap reached, stopping miner.")
 			break
 		}
@@ -590,17 +609,30 @@ func main() {
 
 		if *extremeMode {
 			fmt.Println("[*] Mining one EXTREME credit...")
+		} else if *potatoMode {
+			fmt.Println("[*] Mining one POTATO credit...")
 		} else {
 			fmt.Println("[*] Mining one credit...")
 		}
 
-		sub, powRes, err := mineOneCredit(*extremeMode, nonceOffset)
+		mode := "normal"
+		if *extremeMode {
+			mode = "extreme"
+		} else if *potatoMode {
+			mode = "potato"
+		}
+		sub, powRes, err := mineOneCredit(mode, nonceOffset)
 		if err != nil {
 			errStr := err.Error()
 
 			// If the server reports that the extreme daily cap has been reached, stop cleanly.
 			if *extremeMode && strings.Contains(errStr, "extreme daily cap") {
 				fmt.Println("[*] Extreme daily cap reached according to server, stopping miner.")
+				break
+			}
+			// If the server reports that the potato daily cap has been reached, stop cleanly.
+			if *potatoMode && strings.Contains(errStr, "potato daily cap") {
+				fmt.Println("[*] Potato daily cap reached according to server, stopping miner.")
 				break
 			}
 
